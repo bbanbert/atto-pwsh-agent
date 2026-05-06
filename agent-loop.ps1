@@ -566,6 +566,14 @@ function Build-GooglePayload {
     return $payload
 }
 
+function ConvertTo-JsonUtf8Bytes {
+    param([object]$Payload)
+
+    $json = $Payload | ConvertTo-Json -Depth 100 -Compress
+    $encoding = New-Object System.Text.UTF8Encoding($false, $true)
+    return $encoding.GetBytes($json)
+}
+
 function Invoke-JsonPost {
     param(
         [string]$Url,
@@ -574,9 +582,9 @@ function Invoke-JsonPost {
         [int]$TimeoutSec
     )
 
-    $json = $Payload | ConvertTo-Json -Depth 100 -Compress
+    $bodyBytes = ConvertTo-JsonUtf8Bytes $Payload
     try {
-        return Invoke-RestMethod -Uri $Url -Method Post -Headers $Headers -Body $json -ContentType 'application/json' -TimeoutSec $TimeoutSec
+        return Invoke-RestMethod -Uri $Url -Method Post -Headers $Headers -Body $bodyBytes -ContentType 'application/json; charset=utf-8' -TimeoutSec $TimeoutSec
     } catch [System.Net.WebException] {
         $response = $_.Exception.Response
         if ($response) {
@@ -1302,6 +1310,13 @@ function Run-SelfTest {
         [void]$failures.Add([PSCustomObject]@{ Command = 'missing api key'; Expected = 'ValueError'; Actual = 'no error' })
     } catch {
         # expected
+    }
+
+    $utf8Payload = [ordered]@{ messages = @([PSCustomObject]@{ role = 'user'; content = 'Verknüpfung – €' }) }
+    $utf8Bytes = ConvertTo-JsonUtf8Bytes $utf8Payload
+    $utf8Json = [System.Text.Encoding]::UTF8.GetString($utf8Bytes)
+    if ($utf8Json -notlike '*Verknüpfung*' -or $utf8Bytes -contains 252 -or -not ($utf8Bytes -contains 195)) {
+        [void]$failures.Add([PSCustomObject]@{ Command = 'json utf8 encoding'; Expected = 'UTF-8 bytes for non-ASCII JSON'; Actual = $utf8Json })
     }
 
     $parsedArgs = Parse-CommandLineArgs @('--chat', 'hello')
