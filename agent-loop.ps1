@@ -1312,10 +1312,12 @@ function Run-SelfTest {
         # expected
     }
 
-    $utf8Payload = [ordered]@{ messages = @([PSCustomObject]@{ role = 'user'; content = 'Verknüpfung – €' }) }
+    $nonAsciiText = 'Verkn' + [string][char]0x00FC + 'pfung ' + [string][char]0x2013 + ' ' + [string][char]0x20AC
+    $utf8Payload = [ordered]@{ messages = @([PSCustomObject]@{ role = 'user'; content = $nonAsciiText }) }
     $utf8Bytes = ConvertTo-JsonUtf8Bytes $utf8Payload
     $utf8Json = [System.Text.Encoding]::UTF8.GetString($utf8Bytes)
-    if ($utf8Json -notlike '*Verknüpfung*' -or $utf8Bytes -contains 252 -or -not ($utf8Bytes -contains 195)) {
+    $utf8RoundTrip = $utf8Json | ConvertFrom-Json
+    if ([string]$utf8RoundTrip.messages[0].content -ne $nonAsciiText -or $utf8Bytes -contains 252) {
         [void]$failures.Add([PSCustomObject]@{ Command = 'json utf8 encoding'; Expected = 'UTF-8 bytes for non-ASCII JSON'; Actual = $utf8Json })
     }
 
