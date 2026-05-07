@@ -566,6 +566,14 @@ function Build-GooglePayload {
     return $payload
 }
 
+function ConvertTo-JsonUtf8Bytes {
+    param([object]$Payload)
+
+    $json = $Payload | ConvertTo-Json -Depth 100 -Compress
+    $encoding = New-Object System.Text.UTF8Encoding($false, $true)
+    return $encoding.GetBytes($json)
+}
+
 function Invoke-JsonPost {
     param(
         [string]$Url,
@@ -574,16 +582,56 @@ function Invoke-JsonPost {
         [int]$TimeoutSec
     )
 
-    $json = $Payload | ConvertTo-Json -Depth 100 -Compress
+    $bodyBytes = ConvertTo-JsonUtf8Bytes $Payload
+    $request = [System.Net.WebRequest]::Create($Url)
+    $request.Method = 'POST'
+    $request.ContentType = 'application/json; charset=utf-8'
+    $request.ContentLength = $bodyBytes.Length
+    if ($TimeoutSec -gt 0) {
+        $timeoutMs = [Math]::Min([int64]$TimeoutSec * 1000, [int64][int]::MaxValue)
+        $request.Timeout = [int]$timeoutMs
+        $request.ReadWriteTimeout = [int]$timeoutMs
+    }
+
+    foreach ($key in $Headers.Keys) {
+        if ($key -eq 'Content-Type') {
+            continue
+        }
+        if ($key -eq 'Accept') {
+            $request.Accept = [string]$Headers[$key]
+            continue
+        }
+        $request.Headers[$key] = [string]$Headers[$key]
+    }
+
     try {
-        return Invoke-RestMethod -Uri $Url -Method Post -Headers $Headers -Body $json -ContentType 'application/json' -TimeoutSec $TimeoutSec
+        $requestStream = $request.GetRequestStream()
+        try {
+            $requestStream.Write($bodyBytes, 0, $bodyBytes.Length)
+        } finally {
+            $requestStream.Close()
+        }
+
+        $response = $request.GetResponse()
+        try {
+            $stream = $response.GetResponseStream()
+            $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+            $responseText = $reader.ReadToEnd()
+        } finally {
+            $response.Close()
+        }
+        return ($responseText | ConvertFrom-Json)
     } catch [System.Net.WebException] {
         $response = $_.Exception.Response
         if ($response) {
-            $stream = $response.GetResponseStream()
-            $reader = New-Object System.IO.StreamReader($stream)
-            $detail = $reader.ReadToEnd()
             $code = [int]$response.StatusCode
+            try {
+                $stream = $response.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+                $detail = $reader.ReadToEnd()
+            } finally {
+                $response.Close()
+            }
             throw "HTTP $code`: $detail"
         }
         throw "Could not reach model endpoint: $($_.Exception.Message)"
@@ -1302,6 +1350,15 @@ function Run-SelfTest {
         [void]$failures.Add([PSCustomObject]@{ Command = 'missing api key'; Expected = 'ValueError'; Actual = 'no error' })
     } catch {
         # expected
+    }
+
+    $nonAsciiText = 'Verkn' + [string][char]0x00FC + 'pfung ' + [string][char]0x2013 + ' ' + [string][char]0x20AC
+    $utf8Payload = [ordered]@{ messages = @([PSCustomObject]@{ role = 'user'; content = $nonAsciiText }) }
+    $utf8Bytes = ConvertTo-JsonUtf8Bytes $utf8Payload
+    $utf8Json = [System.Text.Encoding]::UTF8.GetString($utf8Bytes)
+    $utf8RoundTrip = $utf8Json | ConvertFrom-Json
+    if ([string]$utf8RoundTrip.messages[0].content -ne $nonAsciiText -or $utf8Bytes -contains 252) {
+        [void]$failures.Add([PSCustomObject]@{ Command = 'json utf8 encoding'; Expected = 'UTF-8 bytes for non-ASCII JSON'; Actual = $utf8Json })
     }
 
     $parsedArgs = Parse-CommandLineArgs @('--chat', 'hello')
