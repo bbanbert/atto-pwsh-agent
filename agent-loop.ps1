@@ -12,6 +12,51 @@ Notes:
 - Requires a shell profile in config.toml, for example [shells.powershell].
 #>
 
+[CmdletBinding()]
+param(
+    [Alias('Config')]
+    [string]$ConfigPath,
+
+    [Alias('model-profile')]
+    [string]$ModelProfile,
+
+    [ValidateSet('powershell', 'bash')]
+    [string]$Shell,
+
+    [string]$Url,
+
+    [string]$Model,
+
+    [string]$Cwd,
+
+    [int]$MaxSteps,
+
+    [double]$Temperature,
+
+    [int]$MaxTokens,
+
+    [int]$RequestTimeout,
+
+    [int]$MaxOutputChars,
+
+    [int]$MaxOutputRows,
+
+    [int]$MaxOutputCols,
+
+    [switch]$SelfTest,
+
+    [switch]$Chat,
+
+    [switch]$AskAlways,
+
+    [switch]$AutoRunAll,
+
+    [switch]$Help,
+
+    [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
+    [string[]]$Request
+)
+
 Set-StrictMode -Version 2.0
 
 $script:DEFAULT_URL = 'http://127.0.0.1:8080/v1/chat/completions'
@@ -138,37 +183,37 @@ function Show-Usage {
     $scriptName = Split-Path -Leaf $PSCommandPath
     Write-Host @"
 Usage:
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptName [options] [request...]
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptName [parameters] [request...]
 
-Options:
-  --config <path>              TOML config path. Default: $script:DEFAULT_CONFIG
-  --model-profile <name>       Model profile to use from the config.
-  --shell <powershell|bash>    Shell profile to use from the config.
-  --url <url>                  Chat completion URL. Default: $script:DEFAULT_URL
-  --model <name>               Model name. Default: $script:DEFAULT_MODEL
-  --cwd <path>                 Working directory for tool commands.
-  --max-steps <int>            Maximum tool iterations.
-  --temperature <float>        Sampling temperature.
-  --max-tokens <int>           Maximum tokens per model response.
-  --request-timeout <int>      Seconds to wait for each model response.
-  --max-output-chars <int>     Maximum stdout/stderr characters to send back to the model.
-  --max-output-rows <int>      Maximum output rows to send back to the model.
-  --max-output-cols <int>      Maximum characters per output row to send back to the model.
-  --self-test                  Run local parser and safety checks, then exit.
-  --chat                       Prompt for follow-up requests after each final answer.
-  --ask-always                 Ask before every tool command.
-  --auto-run-all               Run every tool command without asking.
-  --help                       Show this help.
+Parameters:
+  -ConfigPath <path>           TOML config path. Default: $script:DEFAULT_CONFIG
+  -ModelProfile <name>         Model profile to use from the config.
+  -Shell <powershell|bash>     Shell profile to use from the config. Tab-completes powershell and bash.
+  -Url <url>                   Chat completion URL. Default: $script:DEFAULT_URL
+  -Model <name>                Model name. Default: $script:DEFAULT_MODEL
+  -Cwd <path>                  Working directory for tool commands.
+  -MaxSteps <int>              Maximum tool iterations.
+  -Temperature <float>         Sampling temperature.
+  -MaxTokens <int>             Maximum tokens per model response.
+  -RequestTimeout <int>        Seconds to wait for each model response.
+  -MaxOutputChars <int>        Maximum stdout/stderr characters to send back to the model.
+  -MaxOutputRows <int>         Maximum output rows to send back to the model.
+  -MaxOutputCols <int>         Maximum characters per output row to send back to the model.
+  -SelfTest                    Run local parser and safety checks, then exit.
+  -Chat                        Prompt for follow-up requests after each final answer.
+  -AskAlways                   Ask before every tool command.
+  -AutoRunAll                  Run every tool command without asking.
+  -Help                        Show this help.
+
+PowerShell native parameter binding provides parameter-name tab completion in Windows PowerShell 5.
 "@
 }
 
-function ConvertTo-ArgName {
-    param([string]$Name)
-    return ($Name.TrimStart('-') -replace '-', '_')
-}
-
-function Parse-CommandLineArgs {
-    param([string[]]$Argv)
+function ConvertFrom-NativeParameters {
+    param(
+        [hashtable]$BoundParameters,
+        [string[]]$Request
+    )
 
     $result = [ordered]@{
         request = New-Object System.Collections.ArrayList
@@ -192,54 +237,47 @@ function Parse-CommandLineArgs {
         help = $false
     }
 
-    $valueOptions = @(
-        'config', 'model_profile', 'shell', 'url', 'model', 'cwd', 'max_steps',
-        'temperature', 'max_tokens', 'request_timeout', 'max_output_chars',
-        'max_output_rows', 'max_output_cols'
-    )
-    $flagOptions = @('self_test', 'chat', 'ask_always', 'auto_run_all', 'help')
+    $parameterMap = @{
+        ConfigPath = 'config'
+        ModelProfile = 'model_profile'
+        Shell = 'shell'
+        Url = 'url'
+        Model = 'model'
+        Cwd = 'cwd'
+        MaxSteps = 'max_steps'
+        Temperature = 'temperature'
+        MaxTokens = 'max_tokens'
+        RequestTimeout = 'request_timeout'
+        MaxOutputChars = 'max_output_chars'
+        MaxOutputRows = 'max_output_rows'
+        MaxOutputCols = 'max_output_cols'
+        SelfTest = 'self_test'
+        Chat = 'chat'
+        AskAlways = 'ask_always'
+        AutoRunAll = 'auto_run_all'
+        Help = 'help'
+    }
 
-    for ($i = 0; $i -lt $Argv.Count; $i++) {
-        $arg = [string]$Argv[$i]
-        if ($arg -eq '--') {
-            for ($j = $i + 1; $j -lt $Argv.Count; $j++) {
-                [void]$result.request.Add([string]$Argv[$j])
+    foreach ($parameterName in $parameterMap.Keys) {
+        if ($BoundParameters.ContainsKey($parameterName)) {
+            $key = $parameterMap[$parameterName]
+            $value = $BoundParameters[$parameterName]
+            if ($value -is [System.Management.Automation.SwitchParameter]) {
+                $result[$key] = [bool]$value
+            } else {
+                $result[$key] = $value
             }
-            break
         }
-        if ($arg.StartsWith('--')) {
-            $name = ConvertTo-ArgName $arg
-            if ($flagOptions -contains $name) {
-                $result[$name] = $true
-                continue
-            }
-            if ($valueOptions -contains $name) {
-                if (($i + 1) -ge $Argv.Count) {
-                    throw "Option $arg requires a value."
-                }
-                $i++
-                $result[$name] = [string]$Argv[$i]
-                continue
-            }
-            throw "Unknown option: $arg"
+    }
+
+    foreach ($item in @($Request)) {
+        if ($null -ne $item) {
+            [void]$result.request.Add([string]$item)
         }
-        [void]$result.request.Add($arg)
     }
 
     if ($result.ask_always -and $result.auto_run_all) {
-        throw '--ask-always and --auto-run-all are mutually exclusive.'
-    }
-    if ($result.shell -and @('powershell', 'bash') -notcontains $result.shell) {
-        throw "--shell must be either 'powershell' or 'bash'."
-    }
-
-    foreach ($key in @('max_steps', 'max_tokens', 'request_timeout', 'max_output_chars', 'max_output_rows', 'max_output_cols')) {
-        if ($null -ne $result[$key]) {
-            $result[$key] = [int]$result[$key]
-        }
-    }
-    if ($null -ne $result.temperature) {
-        $result.temperature = [double]$result.temperature
+        throw '-AskAlways and -AutoRunAll are mutually exclusive.'
     }
 
     return [PSCustomObject]$result
@@ -1361,9 +1399,14 @@ function Run-SelfTest {
         [void]$failures.Add([PSCustomObject]@{ Command = 'json utf8 encoding'; Expected = 'UTF-8 bytes for non-ASCII JSON'; Actual = $utf8Json })
     }
 
-    $parsedArgs = Parse-CommandLineArgs @('--chat', 'hello')
-    if (-not $parsedArgs.chat -or ($parsedArgs.request -join ' ') -ne 'hello') {
-        [void]$failures.Add([PSCustomObject]@{ Command = '--chat arg parse'; Expected = 'True, hello'; Actual = "$($parsedArgs.chat), $($parsedArgs.request -join ' ')" })
+    $ParsedArgs = ConvertFrom-NativeParameters -BoundParameters @{ Chat = [System.Management.Automation.SwitchParameter]::Present } -Request @('hello')
+    if (-not $ParsedArgs.chat -or ($ParsedArgs.request -join ' ') -ne 'hello') {
+        [void]$failures.Add([PSCustomObject]@{ Command = '-Chat native parameter binding'; Expected = 'True, hello'; Actual = "$($ParsedArgs.chat), $($ParsedArgs.request -join ' ')" })
+    }
+
+    $ParsedArgs = ConvertFrom-NativeParameters -BoundParameters @{ ModelProfile = 'local'; MaxSteps = 3; Shell = 'bash' } -Request @('inspect', 'repo')
+    if ($ParsedArgs.model_profile -ne 'local' -or $ParsedArgs.max_steps -ne 3 -or $ParsedArgs.shell -ne 'bash' -or ($ParsedArgs.request -join ' ') -ne 'inspect repo') {
+        [void]$failures.Add([PSCustomObject]@{ Command = 'typed native parameters'; Expected = 'local, 3, bash, inspect repo'; Actual = "$($ParsedArgs.model_profile), $($ParsedArgs.max_steps), $($ParsedArgs.shell), $($ParsedArgs.request -join ' ')" })
     }
 
     foreach ($failure in Run-ConfigSelfTests) {
@@ -1477,39 +1520,31 @@ function Run-AgentTurn {
         [void]$Messages.Add((New-Message 'user' $resultMessage))
     }
 
-    [Console]::Error.WriteLine("`nStopped after --max-steps=$($Config.MaxSteps).")
+    [Console]::Error.WriteLine("`nStopped after -MaxSteps $($Config.MaxSteps).")
     return 1
 }
 
 function Main {
-    param([string[]]$Argv)
+    param([object]$ParsedArgs)
 
-    try {
-        $parsedArgs = Parse-CommandLineArgs $Argv
-    } catch {
-        [Console]::Error.WriteLine($_.Exception.Message)
-        Show-Usage
-        return 2
-    }
-
-    if ($parsedArgs.help) {
+    if ($ParsedArgs.help) {
         Show-Usage
         return 0
     }
 
-    if ($parsedArgs.self_test) {
+    if ($ParsedArgs.self_test) {
         return Run-SelfTest
     }
 
     try {
-        $config = Load-AgentConfig $parsedArgs
+        $config = Load-AgentConfig $ParsedArgs
         $systemPrompt = Load-Prompt $config.Shell.PromptPath
     } catch {
         [Console]::Error.WriteLine($_.Exception.Message)
         return 2
     }
 
-    $request = ($parsedArgs.request -join ' ').Trim()
+    $request = ($ParsedArgs.request -join ' ').Trim()
     if (-not $request) {
         $request = (Read-Host 'User request').Trim()
     }
@@ -1533,8 +1568,8 @@ function Main {
     [void]$messages.Add((New-Message 'user' (Build-InitialUserPrompt -Request $request -SystemPrompt $systemPrompt -Shell $config.Shell)))
 
     while ($true) {
-        $status = Run-AgentTurn -Messages $messages -Request $request -Config $config -CliArgs $parsedArgs -Cwd $cwd
-        if ($status -ne 0 -or -not $parsedArgs.chat) {
+        $status = Run-AgentTurn -Messages $messages -Request $request -Config $config -CliArgs $ParsedArgs -Cwd $cwd
+        if ($status -ne 0 -or -not $ParsedArgs.chat) {
             return $status
         }
         try {
@@ -1549,4 +1584,12 @@ function Main {
     }
 }
 
-exit (Main $args)
+try {
+    $script:nativeArgs = ConvertFrom-NativeParameters -BoundParameters $PSBoundParameters -Request $Request
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    Show-Usage
+    exit 2
+}
+
+exit (Main $script:nativeArgs)
