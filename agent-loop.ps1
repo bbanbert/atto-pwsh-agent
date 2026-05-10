@@ -1060,8 +1060,36 @@ function Quote-NativeArgument {
     }
 
     $quote = [string][char]34
-    $escaped = $Value.Replace($quote, $quote + $quote)
-    return $quote + $escaped + $quote
+    $backslash = [string][char]92
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append($quote)
+
+    $backslashCount = 0
+    foreach ($ch in $Value.ToCharArray()) {
+        if ($ch -eq $backslash) {
+            $backslashCount++
+            continue
+        }
+
+        if ($ch -eq $quote) {
+            [void]$builder.Append($backslash * (($backslashCount * 2) + 1))
+            [void]$builder.Append($quote)
+            $backslashCount = 0
+            continue
+        }
+
+        if ($backslashCount -gt 0) {
+            [void]$builder.Append($backslash * $backslashCount)
+            $backslashCount = 0
+        }
+        [void]$builder.Append($ch)
+    }
+
+    if ($backslashCount -gt 0) {
+        [void]$builder.Append($backslash * ($backslashCount * 2))
+    }
+    [void]$builder.Append($quote)
+    return $builder.ToString()
 }
 
 function Join-NativeArguments {
