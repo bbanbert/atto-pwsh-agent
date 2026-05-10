@@ -12,6 +12,101 @@ Notes:
 - Requires a shell profile in config.toml, for example [shells.powershell].
 #>
 
+[CmdletBinding(PositionalBinding = $false)]
+param(
+    [ArgumentCompleter({
+        param($CommandName, $ParameterName, $WordToComplete)
+
+        Get-ChildItem -Path $WordToComplete* -Filter '*.toml' -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                New-Object System.Management.Automation.CompletionResult `
+                    $_.FullName,
+                    $_.Name,
+                    'ParameterValue',
+                    "TOML config file for $CommandName"
+            }
+    })]
+    [string]$Config,
+
+    [Alias('model-profile')]
+    [ArgumentCompleter({
+        param($CommandName, $ParameterName, $WordToComplete)
+
+        $configPath = Join-Path -Path $PSScriptRoot -ChildPath 'config.toml'
+        if (Test-Path -LiteralPath $configPath) {
+            Get-Content -LiteralPath $configPath -Encoding UTF8 |
+                Where-Object { $_ -match '^\[models\.([^\]]+)\]' } |
+                ForEach-Object { $Matches[1] } |
+                Where-Object { $_ -like "$WordToComplete*" } |
+                ForEach-Object {
+                    New-Object System.Management.Automation.CompletionResult `
+                        $_,
+                        $_,
+                        'ParameterValue',
+                        "Model profile from config.toml"
+                }
+        }
+    })]
+    [string]$ModelProfile,
+
+    [ValidateSet('powershell', 'bash')]
+    [string]$Shell,
+
+    [string]$Url,
+
+    [string]$Model,
+
+    [ArgumentCompleter({
+        param($CommandName, $ParameterName, $WordToComplete)
+
+        Get-ChildItem -Path $WordToComplete* -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                New-Object System.Management.Automation.CompletionResult `
+                    $_.FullName,
+                    $_.Name,
+                    'ParameterValue',
+                    "Working directory for $CommandName"
+            }
+    })]
+    [string]$Cwd,
+
+    [Alias('max-steps')]
+    [int]$MaxSteps,
+
+    [double]$Temperature,
+
+    [Alias('max-tokens')]
+    [int]$MaxTokens,
+
+    [Alias('request-timeout')]
+    [int]$RequestTimeout,
+
+    [Alias('max-output-chars')]
+    [int]$MaxOutputChars,
+
+    [Alias('max-output-rows')]
+    [int]$MaxOutputRows,
+
+    [Alias('max-output-cols')]
+    [int]$MaxOutputCols,
+
+    [Alias('self-test')]
+    [switch]$SelfTest,
+
+    [switch]$Chat,
+
+    [Alias('ask-always')]
+    [switch]$AskAlways,
+
+    [Alias('auto-run-all')]
+    [switch]$AutoRunAll,
+
+    [switch]$Help,
+
+    [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
+    [string[]]$Request
+)
+
 Set-StrictMode -Version 2.0
 
 $script:DEFAULT_URL = 'http://127.0.0.1:8080/v1/chat/completions'
@@ -141,24 +236,24 @@ Usage:
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptName [options] [request...]
 
 Options:
-  --config <path>              TOML config path. Default: $script:DEFAULT_CONFIG
-  --model-profile <name>       Model profile to use from the config.
-  --shell <powershell|bash>    Shell profile to use from the config.
-  --url <url>                  Chat completion URL. Default: $script:DEFAULT_URL
-  --model <name>               Model name. Default: $script:DEFAULT_MODEL
-  --cwd <path>                 Working directory for tool commands.
-  --max-steps <int>            Maximum tool iterations.
-  --temperature <float>        Sampling temperature.
-  --max-tokens <int>           Maximum tokens per model response.
-  --request-timeout <int>      Seconds to wait for each model response.
-  --max-output-chars <int>     Maximum stdout/stderr characters to send back to the model.
-  --max-output-rows <int>      Maximum output rows to send back to the model.
-  --max-output-cols <int>      Maximum characters per output row to send back to the model.
-  --self-test                  Run local parser and safety checks, then exit.
-  --chat                       Prompt for follow-up requests after each final answer.
-  --ask-always                 Ask before every tool command.
-  --auto-run-all               Run every tool command without asking.
-  --help                       Show this help.
+  -Config <path>               TOML config path. Default: $script:DEFAULT_CONFIG
+  -ModelProfile <name>         Model profile to use from the config.
+  -Shell <powershell|bash>     Shell profile to use from the config.
+  -Url <url>                   Chat completion URL. Default: $script:DEFAULT_URL
+  -Model <name>                Model name. Default: $script:DEFAULT_MODEL
+  -Cwd <path>                  Working directory for tool commands.
+  -MaxSteps <int>              Maximum tool iterations.
+  -Temperature <float>         Sampling temperature.
+  -MaxTokens <int>             Maximum tokens per model response.
+  -RequestTimeout <int>        Seconds to wait for each model response.
+  -MaxOutputChars <int>        Maximum stdout/stderr characters to send back to the model.
+  -MaxOutputRows <int>         Maximum output rows to send back to the model.
+  -MaxOutputCols <int>         Maximum characters per output row to send back to the model.
+  -SelfTest                    Run local parser and safety checks, then exit.
+  -Chat                        Prompt for follow-up requests after each final answer.
+  -AskAlways                   Ask before every tool command.
+  -AutoRunAll                  Run every tool command without asking.
+  -Help                        Show this help.
 "@
 }
 
@@ -1322,9 +1417,9 @@ function Run-SelfTest {
     [Environment]::SetEnvironmentVariable('AGENT_LOOP_TEST_KEY', 'test-key', 'Process')
     try {
         $headerCases = @(
-            @(New-ModelConfig 'local' 'openai-chat' $script:DEFAULT_URL $script:DEFAULT_MODEL 0.0 1024 600 '', @{'Content-Type' = 'application/json'}),
-            @(New-ModelConfig 'openrouter' 'openai-chat' 'https://openrouter.ai/api/v1/chat/completions' 'minimax/minimax-m2.5:free' 0.0 2048 120 'AGENT_LOOP_TEST_KEY', @{'Content-Type' = 'application/json'; 'Authorization' = 'Bearer test-key'}),
-            @(New-ModelConfig 'google' 'google-gemini' 'https://generativelanguage.googleapis.com/v1beta' 'models/gemma-4-26b-a4b-it' 0.0 2048 120 'AGENT_LOOP_TEST_KEY', @{'Content-Type' = 'application/json'; 'x-goog-api-key' = 'test-key'})
+            @((New-ModelConfig 'local' 'openai-chat' $script:DEFAULT_URL $script:DEFAULT_MODEL 0.0 1024 600 ''), @{'Content-Type' = 'application/json'}),
+            @((New-ModelConfig 'openrouter' 'openai-chat' 'https://openrouter.ai/api/v1/chat/completions' 'minimax/minimax-m2.5:free' 0.0 2048 120 'AGENT_LOOP_TEST_KEY'), @{'Content-Type' = 'application/json'; 'Authorization' = 'Bearer test-key'}),
+            @((New-ModelConfig 'google' 'google-gemini' 'https://generativelanguage.googleapis.com/v1beta' 'models/gemma-4-26b-a4b-it' 0.0 2048 120 'AGENT_LOOP_TEST_KEY'), @{'Content-Type' = 'application/json'; 'x-goog-api-key' = 'test-key'})
         )
         foreach ($case in $headerCases) {
             $modelConfig = $case[0]
@@ -1549,4 +1644,58 @@ function Main {
     }
 }
 
-exit (Main $args)
+function ConvertTo-LegacyArgv {
+    param(
+        [hashtable]$BoundParameters,
+        [string[]]$RemainingRequest
+    )
+
+    $translated = New-Object System.Collections.ArrayList
+    $valueOptions = @(
+        @('Config', '--config'),
+        @('ModelProfile', '--model-profile'),
+        @('Shell', '--shell'),
+        @('Url', '--url'),
+        @('Model', '--model'),
+        @('Cwd', '--cwd'),
+        @('MaxSteps', '--max-steps'),
+        @('Temperature', '--temperature'),
+        @('MaxTokens', '--max-tokens'),
+        @('RequestTimeout', '--request-timeout'),
+        @('MaxOutputChars', '--max-output-chars'),
+        @('MaxOutputRows', '--max-output-rows'),
+        @('MaxOutputCols', '--max-output-cols')
+    )
+    $flagOptions = @(
+        @('SelfTest', '--self-test'),
+        @('Chat', '--chat'),
+        @('AskAlways', '--ask-always'),
+        @('AutoRunAll', '--auto-run-all'),
+        @('Help', '--help')
+    )
+
+    foreach ($option in $valueOptions) {
+        $parameterName = $option[0]
+        $argumentName = $option[1]
+        if ($BoundParameters.ContainsKey($parameterName) -and $null -ne $BoundParameters[$parameterName]) {
+            [void]$translated.Add($argumentName)
+            [void]$translated.Add([string]$BoundParameters[$parameterName])
+        }
+    }
+
+    foreach ($option in $flagOptions) {
+        $parameterName = $option[0]
+        $argumentName = $option[1]
+        if ($BoundParameters.ContainsKey($parameterName) -and [bool]$BoundParameters[$parameterName]) {
+            [void]$translated.Add($argumentName)
+        }
+    }
+
+    foreach ($item in @($RemainingRequest)) {
+        [void]$translated.Add([string]$item)
+    }
+
+    return @($translated)
+}
+
+exit (Main (ConvertTo-LegacyArgv -BoundParameters $PSBoundParameters -RemainingRequest $Request))
