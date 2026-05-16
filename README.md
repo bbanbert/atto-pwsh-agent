@@ -21,7 +21,7 @@ function atto-pwsh-agent {
     & 'C:\Users\j9100\tmp\agents\atto-pwsh-agent\agent-loop.ps1' @args
 }
 
-´´´
+´´´ POWERSHELL
 [Environment]::SetEnvironmentVariable(
   "OPENROUTER_API_KEY",
   "sk-or-v1-fiktiver-schluessel-1234567890abcdef",
