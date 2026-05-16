@@ -1,3 +1,5 @@
+
+## $PROFILE entries
 $miniSweAgentEnv = Join-Path $env:LOCALAPPDATA 'mini-swe-agent\.env'
 if (Test-Path $miniSweAgentEnv) {
     Get-Content -LiteralPath $miniSweAgentEnv | ForEach-Object {
@@ -21,6 +23,8 @@ function atto-pwsh-agent {
     & 'C:\Users\j9100\tmp\agents\atto-pwsh-agent\agent-loop.ps1' @args
 }
 
+
+## manuell in Terminal
 ´´´ POWERSHELL
 [Environment]::SetEnvironmentVariable(
   "OPENROUTER_API_KEY",
@@ -28,3 +32,4 @@ function atto-pwsh-agent {
   "User"
 )
 ´´´
+echo $env:OPENROUTER_API_KEY
