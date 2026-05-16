@@ -1,0 +1,53 @@
+[agent]
+model_profile = "openrouter"
+shell = "powershell"
+cwd = "."
+max_steps = 15
+max_output_chars = 20000
+
+[models.local]
+provider = "openai-chat"
+url = "http://127.0.0.1:8080/v1/chat/completions"
+model = "gemma-4-E4b-it.Q4_K_M.gguf"
+temperature = 0.0
+max_tokens = 1024
+request_timeout = 600
+
+[models.openrouter]
+provider = "openai-chat"
+url = "https://openrouter.ai/api/v1/chat/completions"
+model = "arcee-ai/trinity-large-thinking:free"
+api_key_env = "OPENROUTER_API_KEY"
+temperature = 0.0
+max_tokens = 2048
+request_timeout = 120
+
+[models.google-gemma-free]
+provider = "google-gemini"
+url = "https://generativelanguage.googleapis.com/v1beta"
+model = "models/gemma-4-26b-a4b-it"
+api_key_env = "GEMINI_API_KEY"
+temperature = 0.0
+max_tokens = 2048
+request_timeout = 120
+
+[models.groq]
+provider = "openai-chat"
+url = "https://api.groq.com/openai/v1/chat/completions" 
+model = "openai/gpt-oss-120b"
+api_key_env = "GROQ_API_KEY"
+temperature = 0.0
+max_tokens = 2048
+request_timeout = 120
+
+[shells.powershell]
+tool = "ps"
+prompt = "prompts/SYSTEM.matlab.md"
+executable = "powershell.exe"
+args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+
+[shells.bash]
+tool = "bash"
+prompt = "prompts/SYSTEM.bash.md"
+executable = "bash"
+args = ["-lc"]
