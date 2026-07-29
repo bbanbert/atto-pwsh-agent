@@ -3,7 +3,7 @@
 $miniSweAgentEnv = Join-Path $env:LOCALAPPDATA 'mini-swe-agent\.env'
 if (Test-Path $miniSweAgentEnv) {
     Get-Content -LiteralPath $miniSweAgentEnv | ForEach-Object {
-        if ($_ -match '^(OPENROUTER_API_KEY|GEMINI_API_KEY|GROQ_API_KEY)=(.*)$') {
+        if ($_ -match '^(OPENROUTER_API_KEY|GROQ_API_KEY)=(.*)$') {
             $name = $Matches[1]
             $value = $Matches[2].Trim().Trim('"').Trim("'")
             Set-Item -Path "Env:$name" -Value $value

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Simple llama.cpp / OpenAI-compatible / Gemini agent loop that executes configured tool calls.
+Simple OpenAI-compatible agent loop that executes configured tool calls.
 
 .DESCRIPTION
 PowerShell 5 migration of the provided Python script. It intentionally avoids PowerShell 7-only
@@ -113,10 +113,6 @@ $script:DEFAULT_URL = 'http://127.0.0.1:8080/v1/chat/completions'
 $script:DEFAULT_MODEL = 'gemma-4-E4b-it.Q4_K_M.gguf'
 $script:DEFAULT_CONFIG = Join-Path -Path $PSScriptRoot -ChildPath 'config.toml'
 
-$script:TOOL_CALL_START_PATTERN = '<(?:\|)?tool_call(?:\|)?>\s*(?:call:)?([A-Za-z0-9_.:-]+)(.*)'
-$script:TOOL_CALL_END_PATTERN = '<(?:\|)?tool_?call\|>'
-$script:NEXT_TOOL_CALL_PATTERN = '<(?:\|)?tool_?call(?:\|)?>'
-
 $script:RISKY_PATTERNS = @(
     'remove-item',
     'rm ',
@@ -225,6 +221,29 @@ function New-Message {
 
     [PSCustomObject]@{
         role = $Role
+        content = $Content
+    }
+}
+
+function New-AssistantToolMessage {
+    param([object[]]$ToolCalls)
+
+    [PSCustomObject]@{
+        role = 'assistant'
+        content = $null
+        tool_calls = @($ToolCalls)
+    }
+}
+
+function New-ToolMessage {
+    param(
+        [string]$ToolCallId,
+        [string]$Content
+    )
+
+    [PSCustomObject]@{
+        role = 'tool'
+        tool_call_id = $ToolCallId
         content = $Content
     }
 }
@@ -620,53 +639,9 @@ function Build-Headers {
         if (-not $apiKey) {
             throw "Model profile '$($ModelConfig.Profile)' requires `$$($ModelConfig.ApiKeyEnv), but that environment variable is not set."
         }
-        if ($ModelConfig.Provider -eq 'google-gemini') {
-            $headers['x-goog-api-key'] = $apiKey
-        } else {
-            $headers['Authorization'] = "Bearer $apiKey"
-        }
+        $headers['Authorization'] = "Bearer $apiKey"
     }
     return $headers
-}
-
-function Build-GooglePayload {
-    param(
-        [object]$ModelConfig,
-        [object[]]$Messages
-    )
-
-    $systemParts = New-Object System.Collections.ArrayList
-    $contents = New-Object System.Collections.ArrayList
-
-    foreach ($message in $Messages) {
-        $role = $message.role
-        $content = [string]$message.content
-        if ($role -eq 'system') {
-            [void]$systemParts.Add([PSCustomObject]@{ text = $content })
-        } elseif ($role -eq 'assistant') {
-            [void]$contents.Add([PSCustomObject]@{
-                role = 'model'
-                parts = @([PSCustomObject]@{ text = $content })
-            })
-        } else {
-            [void]$contents.Add([PSCustomObject]@{
-                role = 'user'
-                parts = @([PSCustomObject]@{ text = $content })
-            })
-        }
-    }
-
-    $payload = [ordered]@{
-        contents = @($contents)
-        generationConfig = [ordered]@{
-            temperature = $ModelConfig.Temperature
-            maxOutputTokens = $ModelConfig.MaxTokens
-        }
-    }
-    if ($systemParts.Count -gt 0) {
-        $payload['systemInstruction'] = [ordered]@{ parts = @($systemParts) }
-    }
-    return $payload
 }
 
 function ConvertTo-JsonUtf8Bytes {
@@ -746,7 +721,8 @@ function Invoke-JsonPost {
 function Chat-OpenAICompatible {
     param(
         [object]$ModelConfig,
-        [object[]]$Messages
+        [object[]]$Messages,
+        [object]$Shell
     )
 
     $payload = [ordered]@{
@@ -754,131 +730,40 @@ function Chat-OpenAICompatible {
         messages = @($Messages)
         temperature = $ModelConfig.Temperature
         max_tokens = $ModelConfig.MaxTokens
+        tools = @([ordered]@{
+            type = 'function'
+            function = [ordered]@{
+                name = $Shell.Tool
+                description = "Run one $($Shell.Name) command in the configured working directory."
+                parameters = [ordered]@{
+                    type = 'object'
+                    properties = [ordered]@{
+                        command = [ordered]@{ type = 'string'; description = "The complete $($Shell.Name) command to run." }
+                    }
+                    required = @('command')
+                    additionalProperties = $false
+                }
+            }
+        })
+        tool_choice = 'auto'
+        parallel_tool_calls = $false
     }
 
     $body = Invoke-JsonPost -Url $ModelConfig.Url -Headers (Build-Headers $ModelConfig) -Payload $payload -TimeoutSec $ModelConfig.RequestTimeout
-    return [string]$body.choices[0].message.content
-}
-
-function Recover-GoogleMalformedToolCall {
-    param([string]$FinishMessage)
-
-    $prefix = 'Malformed function call:'
-    if (-not $FinishMessage.StartsWith($prefix)) {
-        return ''
-    }
-    $body = $FinishMessage.Substring($prefix.Length).Trim()
-    if ($body.ToLowerInvariant().StartsWith('call:')) {
-        return "<|tool_call>$body"
-    }
-    return $body
-}
-
-function Chat-GoogleGemini {
-    param(
-        [object]$ModelConfig,
-        [object[]]$Messages
-    )
-
-    $url = $ModelConfig.Url.TrimEnd('/') + '/' + $ModelConfig.Model + ':generateContent'
-    $payload = Build-GooglePayload -ModelConfig $ModelConfig -Messages $Messages
-    $body = Invoke-JsonPost -Url $url -Headers (Build-Headers $ModelConfig) -Payload $payload -TimeoutSec $ModelConfig.RequestTimeout
-
-    $candidate = $null
-    if ($body.candidates -and $body.candidates.Count -gt 0) {
-        $candidate = $body.candidates[0]
-    }
-    if (-not $candidate) {
-        throw ('Google Gemini response did not contain candidates: ' + (($body | ConvertTo-Json -Depth 20 -Compress).Substring(0, [Math]::Min(1000, ($body | ConvertTo-Json -Depth 20 -Compress).Length))))
-    }
-
-    $parts = @()
-    if ($candidate.content -and $candidate.content.parts) {
-        $parts = @($candidate.content.parts)
-    }
-    $builder = New-Object System.Text.StringBuilder
-    foreach ($part in $parts) {
-        if ($null -ne $part.text) {
-            [void]$builder.Append([string]$part.text)
-        }
-    }
-    $text = $builder.ToString()
-
-    if (-not $text -and $candidate.finishReason -eq 'MALFORMED_FUNCTION_CALL') {
-        $recovered = Recover-GoogleMalformedToolCall ([string]$candidate.finishMessage)
-        if ($recovered) {
-            return $recovered
-        }
-    }
-    if (-not $text) {
-        $raw = $body | ConvertTo-Json -Depth 50 -Compress
-        throw "Google Gemini response did not contain text: $($raw.Substring(0, [Math]::Min(1000, $raw.Length)))"
-    }
-    return $text
+    return $body.choices[0].message
 }
 
 function Invoke-Chat {
     param(
         [object]$ModelConfig,
-        [object[]]$Messages
+        [object[]]$Messages,
+        [object]$Shell
     )
 
-    if ($ModelConfig.Provider -eq 'google-gemini') {
-        return Chat-GoogleGemini -ModelConfig $ModelConfig -Messages $Messages
-    }
     if ($ModelConfig.Provider -ne 'openai-chat') {
         throw "Unsupported model provider for profile '$($ModelConfig.Profile)': $($ModelConfig.Provider)"
     }
-    return Chat-OpenAICompatible -ModelConfig $ModelConfig -Messages $Messages
-}
-
-function Normalize-ToolCallText {
-    param([string]$Text)
-
-    $normalized = [regex]::Replace($Text, '<(?:\|)?tool_call(?:\|)?>\s*\|tool_call:([A-Za-z0-9_.:-]+)', '<tool_call>call:$1', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    $normalized = [regex]::Replace($normalized, '<(?:\|)?tool_call(?:\|)?>\s*\|tool_call>', '<tool_call>', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    return $normalized
-}
-
-function Extract-ToolCall {
-    param([string]$Text)
-
-    $normalizedText = Normalize-ToolCallText $Text
-    $match = [regex]::Match($normalizedText, $script:TOOL_CALL_START_PATTERN, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline)
-    if (-not $match.Success) {
-        return $null
-    }
-
-    $toolName = $match.Groups[1].Value.Trim()
-    $body = $match.Groups[2].Value
-
-    $endMatch = [regex]::Match($body, $script:TOOL_CALL_END_PATTERN, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    if ($endMatch.Success) {
-        $body = $body.Substring(0, $endMatch.Index)
-    }
-
-    $nextMatch = [regex]::Match($body, $script:NEXT_TOOL_CALL_PATTERN, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-    $hadExtraToolCall = $false
-    if ($nextMatch.Success) {
-        $body = $body.Substring(0, $nextMatch.Index)
-        $hadExtraToolCall = $true
-    }
-
-    $command = $body.Trim()
-    if ($command.StartsWith('`') -and $command.EndsWith('`')) {
-        $command = $command.Substring(1, $command.Length - 2).Trim()
-    }
-
-    return [PSCustomObject]@{
-        ToolName = $toolName
-        Command = $command
-        HadExtraToolCall = $hadExtraToolCall
-    }
-}
-
-function Has-ToolCallStart {
-    param([string]$Text)
-    return [regex]::IsMatch((Normalize-ToolCallText $Text), $script:TOOL_CALL_START_PATTERN, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    return Chat-OpenAICompatible -ModelConfig $ModelConfig -Messages $Messages -Shell $Shell
 }
 
 function Looks-Risky {
@@ -1074,12 +959,7 @@ Current date: $date
 
 User request: $Request$recursiveHint
 
-When you need the shell tool, return one complete call in this exact form:
-<|tool_call>call:$($Shell.Tool)
-$($Shell.Name) command here
-<tool_call|>
-
-Return at most one call:$($Shell.Tool) block per response. Wait for the tool result before making another call. The call:$($Shell.Tool) body must be only the command needed to inspect or modify the system. Do not include analysis, summaries, markdown, comments, or invented results inside the block. If the request asks about command output, run that command first. If the request asks you to create, modify, fix, or debug a text file, inspect first, make the smallest useful edit, then verify by reading the file back and rerunning the relevant command. When creating a script, do not give the final answer immediately after writing it; first read it back and run it when the command is non-destructive. When asked to write a script that uses a local helper module, do not modify the helper module unless the user explicitly asks. If verification fails, adjust the generated script or its inputs first. If a generated URL or path returns not found, test small variants derived from the user's exact spelling, including preserved punctuation, dots, hyphens, and removed punctuation, then update and rerun the script.
+Use only the native OpenAI function tool named $($Shell.Tool) when shell work is needed. Pass one JSON object with a single command string. Never emit XML-like tool-call tags, or a hand-written tool-call block. Make at most one function call per response and wait for its result before calling it again. The command argument must contain only the command needed to inspect or modify the system. Do not include analysis, summaries, markdown, comments, or invented results inside the argument. If the request asks about command output, run that command first. If the request asks you to create, modify, fix, or debug a text file, inspect first, make the smallest useful edit, then verify by reading the file back and rerunning the relevant command. When creating a script, do not give the final answer immediately after writing it; first read it back and run it when the command is non-destructive. When asked to write a script that uses a local helper module, do not modify the helper module unless the user explicitly asks. If verification fails, adjust the generated script or its inputs first. If a generated URL or path returns not found, test small variants derived from the user's exact spelling, including preserved punctuation, dots, hyphens, and removed punctuation, then update and rerun the script.
 "@.Trim()
 }
 
@@ -1349,34 +1229,23 @@ function Format-ToolResult {
     $stdout = Trim-Text $stdoutReduced.Text $MaxOutputChars
     $stderr = Trim-Text $stderrReduced.Text $MaxOutputChars
 
-    $reductionSummary = @"
-Reduction summary:
-STDOUT removed rows: $($stdoutReduced.RowsRemoved), removed columns: $($stdoutReduced.ColsRemoved)
-STDERR removed rows: $($stderrReduced.RowsRemoved), removed columns: $($stderrReduced.ColsRemoved)
-
-"@
-
     $recoveryHint = Build-RecoveryHint -Command $Command -Stdout $stdout -Stderr $stderr -OriginalRequest $OriginalRequest
     $stdoutText = if ($stdout) { $stdout } else { '<empty>' }
     $stderrText = if ($stderr) { $stderr } else { '<empty>' }
 
-    return @"
-<|tool_result>call:$ToolName
-Command:
-$Command
-
-Exit code: $($Result.exit_code)
-
-$reductionSummary`STDOUT:
-$stdoutText
-
-STDERR:
-$stderrText
-
-<tool_result|>
-
-Use this result to answer the original user request. If more inspection is needed, call $ToolName again.$recoveryHint
-"@
+    return ([ordered]@{
+        command = $Command
+        exit_code = $Result.exit_code
+        reduction = [ordered]@{
+            stdout_rows_removed = $stdoutReduced.RowsRemoved
+            stdout_columns_removed = $stdoutReduced.ColsRemoved
+            stderr_rows_removed = $stderrReduced.RowsRemoved
+            stderr_columns_removed = $stderrReduced.ColsRemoved
+        }
+        stdout = $stdoutText
+        stderr = $stderrText
+        recovery_hint = $recoveryHint.Trim()
+    } | ConvertTo-Json -Depth 10 -Compress)
 }
 
 function Run-ConfigSelfTests {
@@ -1404,14 +1273,6 @@ temperature = 0.0
 max_tokens = 2048
 request_timeout = 120
 
-[models.google-gemma-free]
-url = "https://generativelanguage.googleapis.com/v1beta"
-provider = "google-gemini"
-model = "models/gemma-4-26b-a4b-it"
-api_key_env = "GEMINI_API_KEY"
-temperature = 0.0
-max_tokens = 2048
-request_timeout = 120
 
 [shells.powershell]
 tool = "ps"
@@ -1454,12 +1315,6 @@ args = ["-NoProfile", "-Command"]
             [void]$failures.Add([PSCustomObject]@{ Command = 'openrouter model profile'; Expected = 'minimax/minimax-m2.5:free'; Actual = $openrouterConfig.Model.Model })
         }
 
-        $googleArgs = $baseArgs.PSObject.Copy()
-        $googleArgs.model_profile = 'google-gemma-free'
-        $googleConfig = Load-AgentConfig $googleArgs
-        if ($googleConfig.Model.Provider -ne 'google-gemini' -or $googleConfig.Model.Model -ne 'models/gemma-4-26b-a4b-it') {
-            [void]$failures.Add([PSCustomObject]@{ Command = 'google model profile'; Expected = 'google-gemini, models/gemma-4-26b-a4b-it'; Actual = "$($googleConfig.Model.Provider), $($googleConfig.Model.Model)" })
-        }
 
         $overrideArgs = $openrouterArgs.PSObject.Copy()
         $overrideArgs.model = 'override/model:free'
@@ -1498,16 +1353,6 @@ function Run-SelfTest {
         @('bash', "python3 - <<'PY'`nfrom pathlib import Path`nPath('buggy.py').write_text(Path('buggy.py').read_text().replace('a + c', 'a + b'))`nPY", $false)
     )
 
-    $parserCases = @(
-        @("<|tool_call>call:ps`nGet-ChildItem`n<tool_call|>", 'ps', 'Get-ChildItem'),
-        @("<|tool_call>call:ps`nGet-ChildItem`n<toolcall|>", 'ps', 'Get-ChildItem'),
-        @("<tool_call>ps`nGet-ChildItem`n<|tool_call|>", 'ps', 'Get-ChildItem'),
-        @("<tool_call>call:ps`nGet-ChildItem`n<|tool_call|>", 'ps', 'Get-ChildItem'),
-        @("<tool_call>|tool_call>ps`nGet-Content Hello_world.py`n<|tool_call|>", 'ps', 'Get-Content Hello_world.py'),
-        @("<tool_call>|tool_call:ps`nGet-Content Hello_world.py`n<|tool_call|>", 'ps', 'Get-Content Hello_world.py'),
-        @("<|tool_call>call:ps`nGet-Location`n<|tool_call|>", 'ps', 'Get-Location'),
-        @("<|tool_call>call:bash`nls -la`n<tool_call|>", 'bash', 'ls -la')
-    )
 
     $failures = New-Object System.Collections.ArrayList
 
@@ -1521,16 +1366,6 @@ function Run-SelfTest {
         }
     }
 
-    foreach ($case in $parserCases) {
-        $text = $case[0]
-        $expectedTool = $case[1]
-        $expectedCommand = $case[2]
-        $parsed = Extract-ToolCall $text
-        if (-not $parsed -or $parsed.ToolName -ne $expectedTool -or $parsed.Command -ne $expectedCommand) {
-            $actual = if ($parsed) { "$($parsed.ToolName), $($parsed.Command)" } else { '<null>' }
-            [void]$failures.Add([PSCustomObject]@{ Command = $text; Expected = "$expectedTool, $expectedCommand"; Actual = $actual })
-        }
-    }
 
     $toolWorkCases = @(
         @('Write Hello_world.py and run it.', $true),
@@ -1574,8 +1409,7 @@ function Run-SelfTest {
     try {
         $headerCases = @(
             @((New-ModelConfig 'local' 'openai-chat' $script:DEFAULT_URL $script:DEFAULT_MODEL 0.0 1024 600 ''), @{'Content-Type' = 'application/json'}),
-            @((New-ModelConfig 'openrouter' 'openai-chat' 'https://openrouter.ai/api/v1/chat/completions' 'minimax/minimax-m2.5:free' 0.0 2048 120 'AGENT_LOOP_TEST_KEY'), @{'Content-Type' = 'application/json'; 'Authorization' = 'Bearer test-key'}),
-            @((New-ModelConfig 'google' 'google-gemini' 'https://generativelanguage.googleapis.com/v1beta' 'models/gemma-4-26b-a4b-it' 0.0 2048 120 'AGENT_LOOP_TEST_KEY'), @{'Content-Type' = 'application/json'; 'x-goog-api-key' = 'test-key'})
+            @((New-ModelConfig 'openrouter' 'openai-chat' 'https://openrouter.ai/api/v1/chat/completions' 'minimax/minimax-m2.5:free' 0.0 2048 120 'AGENT_LOOP_TEST_KEY'), @{'Content-Type' = 'application/json'; 'Authorization' = 'Bearer test-key'})
         )
         foreach ($case in $headerCases) {
             $modelConfig = $case[0]
@@ -1644,53 +1478,61 @@ function Run-AgentTurn {
     for ($step = 1; $step -le $Config.MaxSteps; $step++) {
         Write-Host "`n--- model step $step ---"
         try {
-            $assistantText = Invoke-Chat -ModelConfig $Config.Model -Messages @($Messages)
+            $responseMessage = Invoke-Chat -ModelConfig $Config.Model -Messages @($Messages) -Shell $Config.Shell
         } catch {
             [Console]::Error.WriteLine($_.Exception.Message)
             return 1
         }
 
-        Write-Host $assistantText
-        if (-not $assistantText.Trim()) {
-            [void]$Messages.Add((New-Message 'user' "Your previous answer was empty. Return either one complete <|tool_call>call:$($Config.Shell.Tool) tool call for inspection or a final plain-text answer."))
-            continue
+        $assistantText = ''
+        if ($responseMessage.PSObject.Properties['content']) {
+            $assistantText = [string]$responseMessage.content
         }
-
-        [void]$Messages.Add((New-Message 'assistant' $assistantText))
-        $toolCall = Extract-ToolCall $assistantText
-
-        if ($null -eq $toolCall -and (Has-ToolCallStart $assistantText)) {
-            [void]$Messages.Add((New-Message 'user' "The tool call was malformed. Use exactly this format if more inspection is needed:`n<|tool_call>call:$($Config.Shell.Tool)`n$($Config.Shell.Name) command here`n<tool_call|>`nOtherwise return the final answer in plain text."))
-            continue
+        $toolCalls = @()
+        if ($responseMessage.PSObject.Properties['tool_calls'] -and $responseMessage.tool_calls) {
+            $toolCalls = @($responseMessage.tool_calls)
         }
-        if ($null -eq $toolCall) {
+        if ($assistantText) { Write-Host $assistantText }
+
+        if ($toolCalls.Count -eq 0) {
+            if (-not $assistantText.Trim()) {
+                [void]$Messages.Add((New-Message 'user' 'Your previous answer was empty. Return a final answer or call the available function tool.'))
+                continue
+            }
+            [void]$Messages.Add((New-Message 'assistant' $assistantText))
             if ($toolCallsExecuted -eq 0 -and (Request-RequiresToolWork $Request)) {
-                [void]$Messages.Add((New-Message 'user' "The original request requires actual shell work before a final answer. Send exactly one call:$($Config.Shell.Tool) block now that performs the next required action, then wait for the tool result."))
+                [void]$Messages.Add((New-Message 'user' "The original request requires actual shell work before a final answer. Call the $($Config.Shell.Tool) function tool now."))
                 continue
             }
             return 0
         }
 
-        $toolName = $toolCall.ToolName
-        $command = $toolCall.Command
-        $hadExtraToolCall = $toolCall.HadExtraToolCall
+        [void]$Messages.Add((New-AssistantToolMessage $toolCalls))
+        $toolCall = $toolCalls[0]
+        $toolName = [string]$toolCall.function.name
+        $command = ''
+        try {
+            $arguments = ([string]$toolCall.function.arguments) | ConvertFrom-Json
+            $command = [string]$arguments.command
+        } catch {
+            [void]$Messages.Add((New-ToolMessage -ToolCallId ([string]$toolCall.id) -Content '{"error":"Tool arguments must be valid JSON with a command string."}'))
+            continue
+        }
 
         if ($toolName.ToLowerInvariant() -ne $Config.Shell.Tool.ToLowerInvariant()) {
-            [void]$Messages.Add((New-Message 'user' "Unsupported tool call: call:$toolName. Only call:$($Config.Shell.Tool) is available. Use call:$($Config.Shell.Tool) for shell inspection or return the final answer in plain text."))
+            $errorJson = [ordered]@{ error = "Unsupported tool '$toolName'. Only '$($Config.Shell.Tool)' is available." } | ConvertTo-Json -Compress
+            [void]$Messages.Add((New-ToolMessage -ToolCallId ([string]$toolCall.id) -Content $errorJson))
             continue
         }
         if (-not $command) {
-            [void]$Messages.Add((New-Message 'user' "The call:$($Config.Shell.Tool) tool call did not contain a command. Resend one complete call:$($Config.Shell.Tool) tool call with the command body, or return the final answer."))
+            [void]$Messages.Add((New-ToolMessage -ToolCallId ([string]$toolCall.id) -Content '{"error":"The command argument must not be empty."}'))
             continue
         }
 
         if (Uses-FragileScriptWrite -Command $command -ShellName $Config.Shell.Name) {
-            if ($Config.Shell.Name -eq 'powershell') {
-                $rewriteHint = 'use a PowerShell here-string piped to Set-Content -Encoding UTF8'
-            } else {
-                $rewriteHint = "use a quoted Bash here-doc such as cat > file.py <<'PY'"
-            }
-            [void]$Messages.Add((New-Message 'user' "Do not write script bodies with fragile single-line redirection or quoted pipeline strings. Resend exactly one call:$($Config.Shell.Tool) command that uses $rewriteHint, then wait for the tool result."))
+            $hint = if ($Config.Shell.Name -eq 'powershell') { 'Use a PowerShell here-string piped to Set-Content -Encoding UTF8.' } else { "Use a quoted Bash here-doc such as cat > file.py <<'PY'." }
+            $errorJson = [ordered]@{ error = $hint } | ConvertTo-Json -Compress
+            [void]$Messages.Add((New-ToolMessage -ToolCallId ([string]$toolCall.id) -Content $errorJson))
             continue
         }
 
@@ -1703,35 +1545,16 @@ function Run-AgentTurn {
         Write-Host $command
         $result = Run-ShellCommand -Command $command -Cwd $Cwd -Shell $Config.Shell
         $toolCallsExecuted++
-
         Write-Host "Exit code: $($result.exit_code)"
-        $stdoutReduced = Reduce-TextByRowsAndCols ([string]$result.stdout) $Config.MaxOutputRows $Config.MaxOutputCols
-        $stderrReduced = Reduce-TextByRowsAndCols ([string]$result.stderr) $Config.MaxOutputRows $Config.MaxOutputCols
 
-        if ($stdoutReduced.Text) {
-            Write-Host '[Reduced STDOUT context]'
-            Write-Host "removed rows=$($stdoutReduced.RowsRemoved), removed columns=$($stdoutReduced.ColsRemoved)"
-            Write-Host (Trim-Text $stdoutReduced.Text $Config.MaxOutputChars)
-        }
-        if ($stderrReduced.Text) {
-            [Console]::Error.WriteLine('[Reduced STDERR context]')
-            [Console]::Error.WriteLine("removed rows=$($stderrReduced.RowsRemoved), removed columns=$($stderrReduced.ColsRemoved)")
-            [Console]::Error.WriteLine((Trim-Text $stderrReduced.Text $Config.MaxOutputChars))
-        }
+        $resultJson = Format-ToolResult -Command $command -Result $result -MaxOutputChars $Config.MaxOutputChars -MaxOutputRows $Config.MaxOutputRows -MaxOutputCols $Config.MaxOutputCols -ToolName $Config.Shell.Tool -OriginalRequest $Request
+        [void]$Messages.Add((New-ToolMessage -ToolCallId ([string]$toolCall.id) -Content $resultJson))
 
-        $resultMessage = Format-ToolResult `
-            -Command $command `
-            -Result $result `
-            -MaxOutputChars $Config.MaxOutputChars `
-            -MaxOutputRows $Config.MaxOutputRows `
-            -MaxOutputCols $Config.MaxOutputCols `
-            -ToolName $Config.Shell.Tool `
-            -OriginalRequest $Request
-
-        if ($hadExtraToolCall) {
-            $resultMessage += "`n`nYour previous response contained more than one tool call. Only the first tool call was executed. If another command is still needed, send exactly one new call:$($Config.Shell.Tool) now. Do not claim that skipped commands ran."
+        if ($toolCalls.Count -gt 1) {
+            for ($i = 1; $i -lt $toolCalls.Count; $i++) {
+                [void]$Messages.Add((New-ToolMessage -ToolCallId ([string]$toolCalls[$i].id) -Content '{"error":"Only one tool call is executed per model response. Call again on the next step."}'))
+            }
         }
-        [void]$Messages.Add((New-Message 'user' $resultMessage))
     }
 
     [Console]::Error.WriteLine("`nStopped after --max-steps=$($Config.MaxSteps).")
