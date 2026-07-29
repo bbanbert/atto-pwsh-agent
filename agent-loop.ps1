@@ -113,9 +113,9 @@ $script:DEFAULT_URL = 'http://127.0.0.1:8080/v1/chat/completions'
 $script:DEFAULT_MODEL = 'gemma-4-E4b-it.Q4_K_M.gguf'
 $script:DEFAULT_CONFIG = Join-Path -Path $PSScriptRoot -ChildPath 'config.toml'
 
-$script:TOOL_CALL_START_PATTERN = '<\|tool_call\>\s*call:([A-Za-z0-9_.:-]+)(.*)'
-$script:TOOL_CALL_END_PATTERN = '<(?:\|)?tool_call\|>'
-$script:NEXT_TOOL_CALL_PATTERN = '<\|tool_call\>'
+$script:TOOL_CALL_START_PATTERN = '<(?:\|)?tool_call(?:\|)?>\s*(?:call:)?([A-Za-z0-9_.:-]+)(.*)'
+$script:TOOL_CALL_END_PATTERN = '<(?:\|)?tool_?call\|>'
+$script:NEXT_TOOL_CALL_PATTERN = '<(?:\|)?tool_?call(?:\|)?>'
 
 $script:RISKY_PATTERNS = @(
     'remove-item',
@@ -513,10 +513,18 @@ function Resolve-ConfigPath {
     return [System.IO.Path]::GetFullPath((Join-Path $Base $expanded))
 }
 
+function Get-CurrentFileSystemPath {
+    $location = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation
+    if ($location.ProviderPath) {
+        return $location.ProviderPath
+    }
+    return $location.Path
+}
+
 function Load-AgentConfig {
     param([object]$CliArgs)
 
-    $configPath = Resolve-ConfigPath ([string]$CliArgs.config) (Get-Location).Path
+    $configPath = Resolve-ConfigPath ([string]$CliArgs.config) (Get-CurrentFileSystemPath)
     $configBase = Split-Path -Parent $configPath
     $raw = Read-TomlFile $configPath
 
@@ -824,10 +832,19 @@ function Invoke-Chat {
     return Chat-OpenAICompatible -ModelConfig $ModelConfig -Messages $Messages
 }
 
+function Normalize-ToolCallText {
+    param([string]$Text)
+
+    $normalized = [regex]::Replace($Text, '<(?:\|)?tool_call(?:\|)?>\s*\|tool_call:([A-Za-z0-9_.:-]+)', '<tool_call>call:$1', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $normalized = [regex]::Replace($normalized, '<(?:\|)?tool_call(?:\|)?>\s*\|tool_call>', '<tool_call>', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    return $normalized
+}
+
 function Extract-ToolCall {
     param([string]$Text)
 
-    $match = [regex]::Match($Text, $script:TOOL_CALL_START_PATTERN, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    $normalizedText = Normalize-ToolCallText $Text
+    $match = [regex]::Match($normalizedText, $script:TOOL_CALL_START_PATTERN, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline)
     if (-not $match.Success) {
         return $null
     }
@@ -861,7 +878,7 @@ function Extract-ToolCall {
 
 function Has-ToolCallStart {
     param([string]$Text)
-    return [regex]::IsMatch($Text, $script:TOOL_CALL_START_PATTERN, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    return [regex]::IsMatch((Normalize-ToolCallText $Text), $script:TOOL_CALL_START_PATTERN, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline)
 }
 
 function Looks-Risky {
@@ -943,14 +960,50 @@ function Uses-FragileScriptWrite {
     return Uses-FragilePowerShellScriptWrite $Command
 }
 
+function Is-ExpectedRequestedFileWork {
+    param(
+        [string]$Command,
+        [string]$Request,
+        [string]$ShellName
+    )
+
+    if ($ShellName -ne 'powershell' -or -not (Request-RequiresToolWork $Request)) {
+        return $false
+    }
+
+    $lowered = $Command.ToLowerInvariant()
+    foreach ($blocked in @('remove-item', ' rm ', 'del ', 'erase ', 'move-item', 'copy-item', 'rename-item', 'invoke-webrequest', 'iwr ', 'invoke-restmethod', 'irm ', 'start-process', 'stop-process', 'set-executionpolicy', '>', '>>')) {
+        if ((' ' + $lowered + ' ').Contains($blocked)) {
+            return $false
+        }
+    }
+    if (-not $lowered.Contains('set-content')) {
+        return $false
+    }
+
+    $matches = [regex]::Matches($Command, '(?i)(?:-Path|-LiteralPath)?\s*[''"]?([^''"\s;|]+\.(?:py|ps1))[''"]?')
+    foreach ($match in $matches) {
+        $path = $match.Groups[1].Value
+        if ($path -match '^[A-Za-z]:[\\/]' -or $path.Contains('\') -or $path.Contains('/') -or $path.Contains('..')) {
+            continue
+        }
+        return $true
+    }
+    return $false
+}
+
 function Should-RunCommand {
     param(
         [string]$Command,
         [object]$CliArgs,
-        [string]$ShellName
+        [string]$ShellName,
+        [string]$Request = ''
     )
 
     if ($CliArgs.auto_run_all) {
+        return $true
+    }
+    if (Is-ExpectedRequestedFileWork -Command $Command -Request $Request -ShellName $ShellName) {
         return $true
     }
     if ($CliArgs.ask_always -or (Looks-RiskyForShell -Command $Command -ShellName $ShellName)) {
@@ -977,6 +1030,19 @@ function Needs-RecursiveSearch {
         }
     }
     return $false
+}
+
+function Request-RequiresToolWork {
+    param([string]$Request)
+
+    $lowered = $Request.ToLowerInvariant()
+    $actionPattern = '\b(write|create|make|generate|update|modify|edit|fix|debug|run|execute|test|verify|extract|read|inspect|access)\b'
+    $targetPattern = '(\.[A-Za-z0-9]{1,12}\b|script\b|file\b|program\b|command\b|path\b|folder\b|director(?:y|ies)\b|repo(?:sitory)?\b)'
+
+    return (
+        [regex]::IsMatch($lowered, $actionPattern) -and
+        [regex]::IsMatch($lowered, $targetPattern)
+    )
 }
 
 function Load-Prompt {
@@ -1226,6 +1292,15 @@ function Build-RecoveryHint {
     )
 
     $text = "$Command`n$Stdout`n$Stderr".ToLowerInvariant()
+    if (
+        $text.Contains('cannot find path') -or
+        $text.Contains('path not found') -or
+        $text.Contains('kann nicht gefunden werden') -or
+        $text.Contains('cannot be found because it does not exist')
+    ) {
+        return "`n`nThe requested local path or filename was not found. Do not conclude that no usable file exists yet. Inspect the containing directory with Get-ChildItem, look for a likely spelling or extension variant of the name in the original request, and test the closest unambiguous match. Clearly mention any filename correction in the final answer."
+    }
+
     if ($text.Contains('status code: 404') -or $text.Contains(' 404') -or $text.Contains('existiert leider nicht') -or $text.Contains('page does not exist')) {
         $punctuatedTokens = New-Object System.Collections.ArrayList
         foreach ($m in [regex]::Matches($OriginalRequest, '\b[A-Za-z0-9]+[.\-][A-Za-z0-9]+\b')) {
@@ -1392,6 +1467,17 @@ args = ["-NoProfile", "-Command"]
         if ($overrideConfig.Model.Model -ne 'override/model:free') {
             [void]$failures.Add([PSCustomObject]@{ Command = 'model override'; Expected = 'override/model:free'; Actual = $overrideConfig.Model.Model })
         }
+
+        Push-Location -LiteralPath "Microsoft.PowerShell.Core\FileSystem::$tempDir"
+        try {
+            $providerPath = Get-CurrentFileSystemPath
+            $resolvedCwd = Resolve-ConfigPath '.' $providerPath
+            if ($resolvedCwd -ne [System.IO.Path]::GetFullPath($tempDir)) {
+                [void]$failures.Add([PSCustomObject]@{ Command = 'provider-qualified current directory'; Expected = [System.IO.Path]::GetFullPath($tempDir); Actual = $resolvedCwd })
+            }
+        } finally {
+            Pop-Location
+        }
     } finally {
         Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -1414,6 +1500,11 @@ function Run-SelfTest {
 
     $parserCases = @(
         @("<|tool_call>call:ps`nGet-ChildItem`n<tool_call|>", 'ps', 'Get-ChildItem'),
+        @("<|tool_call>call:ps`nGet-ChildItem`n<toolcall|>", 'ps', 'Get-ChildItem'),
+        @("<tool_call>ps`nGet-ChildItem`n<|tool_call|>", 'ps', 'Get-ChildItem'),
+        @("<tool_call>call:ps`nGet-ChildItem`n<|tool_call|>", 'ps', 'Get-ChildItem'),
+        @("<tool_call>|tool_call>ps`nGet-Content Hello_world.py`n<|tool_call|>", 'ps', 'Get-Content Hello_world.py'),
+        @("<tool_call>|tool_call:ps`nGet-Content Hello_world.py`n<|tool_call|>", 'ps', 'Get-Content Hello_world.py'),
         @("<|tool_call>call:ps`nGet-Location`n<|tool_call|>", 'ps', 'Get-Location'),
         @("<|tool_call>call:bash`nls -la`n<tool_call|>", 'bash', 'ls -la')
     )
@@ -1438,6 +1529,43 @@ function Run-SelfTest {
         if (-not $parsed -or $parsed.ToolName -ne $expectedTool -or $parsed.Command -ne $expectedCommand) {
             $actual = if ($parsed) { "$($parsed.ToolName), $($parsed.Command)" } else { '<null>' }
             [void]$failures.Add([PSCustomObject]@{ Command = $text; Expected = "$expectedTool, $expectedCommand"; Actual = $actual })
+        }
+    }
+
+    $toolWorkCases = @(
+        @('Write Hello_world.py and run it.', $true),
+        @('Create a script that prints hello.', $true),
+        @('Run the command and summarize the output.', $true),
+        @('Extract the path in error.txt and test if you can access it.', $true),
+        @('Explain what Python is.', $false)
+    )
+    foreach ($case in $toolWorkCases) {
+        $requestText = $case[0]
+        $expected = [bool]$case[1]
+        $actual = Request-RequiresToolWork $requestText
+        if ($actual -ne $expected) {
+            [void]$failures.Add([PSCustomObject]@{ Command = "Request-RequiresToolWork: $requestText"; Expected = $expected; Actual = $actual })
+        }
+    }
+
+    $missingFileHint = Build-RecoveryHint -Command 'Get-Content error.txt' -Stdout '' -Stderr 'Der Pfad error.txt kann nicht gefunden werden, da er nicht vorhanden ist.' -OriginalRequest 'Read error.txt'
+    if (-not $missingFileHint.Contains('Get-ChildItem')) {
+        [void]$failures.Add([PSCustomObject]@{ Command = 'missing local file recovery'; Expected = 'Get-ChildItem recovery hint'; Actual = $missingFileHint })
+    }
+
+    $expectedWorkCases = @(
+        @("@'`nprint(`"Hello, World!`")`n'@ | Set-Content -Encoding UTF8 Hello_world.py; py -3.14 Hello_world.py", 'Write Hello_world.py and run it.', $true),
+        @("Set-Content -Path C:\temp\Hello_world.py -Value 'print(1)'", 'Write Hello_world.py and run it.', $false),
+        @("@'`nprint(1)`n'@ | Set-Content -Encoding UTF8 ..\Hello_world.py", 'Write Hello_world.py and run it.', $false),
+        @("@'`nprint(1)`n'@ | Set-Content -Encoding UTF8 Hello_world.py; Remove-Item other.txt", 'Write Hello_world.py and run it.', $false)
+    )
+    foreach ($case in $expectedWorkCases) {
+        $commandText = $case[0]
+        $requestText = $case[1]
+        $expected = [bool]$case[2]
+        $actual = Is-ExpectedRequestedFileWork -Command $commandText -Request $requestText -ShellName 'powershell'
+        if ($actual -ne $expected) {
+            [void]$failures.Add([PSCustomObject]@{ Command = "Is-ExpectedRequestedFileWork: $commandText"; Expected = $expected; Actual = $actual })
         }
     }
 
@@ -1512,6 +1640,7 @@ function Run-AgentTurn {
         [string]$Cwd
     )
 
+    $toolCallsExecuted = 0
     for ($step = 1; $step -le $Config.MaxSteps; $step++) {
         Write-Host "`n--- model step $step ---"
         try {
@@ -1535,6 +1664,10 @@ function Run-AgentTurn {
             continue
         }
         if ($null -eq $toolCall) {
+            if ($toolCallsExecuted -eq 0 -and (Request-RequiresToolWork $Request)) {
+                [void]$Messages.Add((New-Message 'user' "The original request requires actual shell work before a final answer. Send exactly one call:$($Config.Shell.Tool) block now that performs the next required action, then wait for the tool result."))
+                continue
+            }
             return 0
         }
 
@@ -1561,7 +1694,7 @@ function Run-AgentTurn {
             continue
         }
 
-        if (-not (Should-RunCommand -Command $command -CliArgs $CliArgs -ShellName $Config.Shell.Name)) {
+        if (-not (Should-RunCommand -Command $command -CliArgs $CliArgs -ShellName $Config.Shell.Name -Request $Request)) {
             Write-Host 'Command skipped by user.'
             return 1
         }
@@ -1569,6 +1702,7 @@ function Run-AgentTurn {
         Write-Host "`n--- $($Config.Shell.Name) step $step ---"
         Write-Host $command
         $result = Run-ShellCommand -Command $command -Cwd $Cwd -Shell $Config.Shell
+        $toolCallsExecuted++
 
         Write-Host "Exit code: $($result.exit_code)"
         $stdoutReduced = Reduce-TextByRowsAndCols ([string]$result.stdout) $Config.MaxOutputRows $Config.MaxOutputCols
@@ -1641,7 +1775,7 @@ function Main {
         return 2
     }
 
-    $cwd = Resolve-ConfigPath ([string]$config.Cwd) (Get-Location).Path
+    $cwd = Resolve-ConfigPath ([string]$config.Cwd) (Get-CurrentFileSystemPath)
     if (-not (Test-Path -LiteralPath $cwd -PathType Container)) {
         [Console]::Error.WriteLine("Working directory does not exist or is not a directory: $cwd")
         return 2
