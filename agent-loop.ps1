@@ -515,10 +515,19 @@ function Resolve-ConfigPath {
     return [System.IO.Path]::GetFullPath((Join-Path $Base $expanded))
 }
 
+function Get-CurrentFileSystemPath {
+    # Get-Location.Path may include the PowerShell provider qualifier for UNC
+    # locations (for example, Microsoft.PowerShell.Core\FileSystem::\\server\share).
+    # Resolve "." through the provider API so callers receive a native file-system
+    # path that can safely be combined with relative config values.
+    $path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('.')
+    return [System.IO.Path]::GetFullPath($path)
+}
+
 function Load-AgentConfig {
     param([object]$CliArgs)
 
-    $configPath = Resolve-ConfigPath ([string]$CliArgs.config) (Get-Location).Path
+    $configPath = Resolve-ConfigPath ([string]$CliArgs.config) (Get-CurrentFileSystemPath)
     $configBase = Split-Path -Parent $configPath
     $raw = Read-TomlFile $configPath
 
@@ -1476,6 +1485,11 @@ function Run-SelfTest {
 
     $failures = New-Object System.Collections.ArrayList
 
+    $currentFileSystemPath = Get-CurrentFileSystemPath
+    if (-not [System.IO.Path]::IsPathRooted($currentFileSystemPath) -or $currentFileSystemPath -like '*FileSystem::*') {
+        [void]$failures.Add([PSCustomObject]@{ Command = 'current file-system path'; Expected = 'rooted native path without a provider qualifier'; Actual = $currentFileSystemPath })
+    }
+
     foreach ($case in $cases) {
         $shellName = $case[0]
         $command = $case[1]
@@ -1697,7 +1711,7 @@ function Main {
         return 2
     }
 
-    $cwd = Resolve-ConfigPath ([string]$config.Cwd) (Get-Location).Path
+    $cwd = Resolve-ConfigPath ([string]$config.Cwd) (Get-CurrentFileSystemPath)
     if (-not (Test-Path -LiteralPath $cwd -PathType Container)) {
         [Console]::Error.WriteLine("Working directory does not exist or is not a directory: $cwd")
         return 2
