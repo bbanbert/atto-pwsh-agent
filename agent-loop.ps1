@@ -113,9 +113,9 @@ $script:DEFAULT_URL = 'http://127.0.0.1:8080/v1/chat/completions'
 $script:DEFAULT_MODEL = 'gemma-4-E4b-it.Q4_K_M.gguf'
 $script:DEFAULT_CONFIG = Join-Path -Path $PSScriptRoot -ChildPath 'config.toml'
 
-$script:TOOL_CALL_START_PATTERN = '<\|tool_call\>\s*call:([A-Za-z0-9_.:-]+)(.*)'
+$script:TOOL_CALL_START_PATTERN = '<\|tool_call\|?>\s*call:([A-Za-z0-9_.:-]+)(.*)'
 $script:TOOL_CALL_END_PATTERN = '<(?:\|)?tool_call\|>'
-$script:NEXT_TOOL_CALL_PATTERN = '<\|tool_call\>'
+$script:NEXT_TOOL_CALL_PATTERN = '<\|tool_call\|?>'
 
 $script:RISKY_PATTERNS = @(
     'remove-item',
@@ -1469,6 +1469,7 @@ function Run-SelfTest {
 
     $parserCases = @(
         @("<|tool_call>call:ps`nGet-ChildItem`n<tool_call|>", 'ps', 'Get-ChildItem'),
+        @("<|tool_call|>call:ps`nGet-ChildItem -Filter jupyter*.py`n<tool_call|>", 'ps', 'Get-ChildItem -Filter jupyter*.py'),
         @("<|tool_call>call:ps`nGet-Location`n<|tool_call|>", 'ps', 'Get-Location'),
         @("<|tool_call>call:bash`nls -la`n<tool_call|>", 'bash', 'ls -la')
     )
