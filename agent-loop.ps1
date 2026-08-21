@@ -162,7 +162,8 @@ function New-ModelConfig {
         [double]$Temperature,
         [int]$MaxTokens,
         [int]$RequestTimeout,
-        [string]$ApiKeyEnv
+        [string]$ApiKeyEnv,
+        [string[]]$OpenRouterProviderOrder = @()
     )
 
     [PSCustomObject]@{
@@ -174,6 +175,7 @@ function New-ModelConfig {
         MaxTokens = $MaxTokens
         RequestTimeout = $RequestTimeout
         ApiKeyEnv = $ApiKeyEnv
+        OpenRouterProviderOrder = @($OpenRouterProviderOrder)
     }
 }
 
@@ -582,6 +584,12 @@ function Load-AgentConfig {
     if ($modelSection.ContainsKey('provider')) { $provider = [string]$modelSection['provider'] }
     $apiKeyEnv = ''
     if ($modelSection.ContainsKey('api_key_env')) { $apiKeyEnv = [string]$modelSection['api_key_env'] }
+    $openRouterProviderOrder = @()
+    if ($modelSection.ContainsKey('openrouter_provider_order')) {
+        foreach ($value in @($modelSection['openrouter_provider_order'])) {
+            $openRouterProviderOrder += [string]$value
+        }
+    }
 
     $model = New-ModelConfig `
         -Profile ([string]$modelProfile) `
@@ -591,7 +599,8 @@ function Load-AgentConfig {
         -Temperature ([double](Get-ConfigValue $CliArgs $modelSection 'temperature' 0.0)) `
         -MaxTokens ([int](Get-ConfigValue $CliArgs $modelSection 'max_tokens' 1024)) `
         -RequestTimeout ([int](Get-ConfigValue $CliArgs $modelSection 'request_timeout' 600)) `
-        -ApiKeyEnv $apiKeyEnv
+        -ApiKeyEnv $apiKeyEnv `
+        -OpenRouterProviderOrder $openRouterProviderOrder
 
     return New-AgentConfig `
         -Cwd ([string](Get-ConfigValue $CliArgs $agentSection 'cwd' '.')) `
@@ -735,7 +744,7 @@ function Invoke-JsonPost {
     }
 }
 
-function Chat-OpenAICompatible {
+function Build-OpenAICompatiblePayload {
     param(
         [object]$ModelConfig,
         [object[]]$Messages
@@ -747,7 +756,21 @@ function Chat-OpenAICompatible {
         temperature = $ModelConfig.Temperature
         max_tokens = $ModelConfig.MaxTokens
     }
+    if (@($ModelConfig.OpenRouterProviderOrder).Count -gt 0) {
+        $payload['provider'] = [ordered]@{
+            order = @($ModelConfig.OpenRouterProviderOrder)
+        }
+    }
+    return $payload
+}
 
+function Chat-OpenAICompatible {
+    param(
+        [object]$ModelConfig,
+        [object[]]$Messages
+    )
+
+    $payload = Build-OpenAICompatiblePayload -ModelConfig $ModelConfig -Messages $Messages
     $body = Invoke-JsonPost -Url $ModelConfig.Url -Headers (Build-Headers $ModelConfig) -Payload $payload -TimeoutSec $ModelConfig.RequestTimeout
     return [string]$body.choices[0].message.content
 }
@@ -1329,6 +1352,15 @@ temperature = 0.0
 max_tokens = 2048
 request_timeout = 120
 
+[models.openrouter-deepseek-flash-coreweave]
+url = "https://openrouter.ai/api/v1/chat/completions"
+provider = "openai-chat"
+model = "deepseek/deepseek-v4-flash-0731"
+openrouter_provider_order = ["coreweave"]
+temperature = 0.0
+max_tokens = 2048
+request_timeout = 120
+
 [models.google-gemma-free]
 url = "https://generativelanguage.googleapis.com/v1beta"
 provider = "google-gemini"
@@ -1378,12 +1410,35 @@ args = ["-NoProfile", "-Command"]
         if ($openrouterConfig.Model.Model -ne 'minimax/minimax-m2.5:free') {
             [void]$failures.Add([PSCustomObject]@{ Command = 'openrouter model profile'; Expected = 'minimax/minimax-m2.5:free'; Actual = $openrouterConfig.Model.Model })
         }
+        if (@($openrouterConfig.Model.OpenRouterProviderOrder).Count -ne 0) {
+            [void]$failures.Add([PSCustomObject]@{ Command = 'default OpenRouter provider order'; Expected = 'empty array'; Actual = ($openrouterConfig.Model.OpenRouterProviderOrder -join ',') })
+        }
+
+        $deepseekArgs = $baseArgs.PSObject.Copy()
+        $deepseekArgs.model_profile = 'openrouter-deepseek-flash-coreweave'
+        $deepseekConfig = Load-AgentConfig $deepseekArgs
+        if ($deepseekConfig.Model.Model -ne 'deepseek/deepseek-v4-flash-0731') {
+            [void]$failures.Add([PSCustomObject]@{ Command = 'DeepSeek OpenRouter model profile'; Expected = 'deepseek/deepseek-v4-flash-0731'; Actual = $deepseekConfig.Model.Model })
+        }
+        $deepseekPayload = Build-OpenAICompatiblePayload -ModelConfig $deepseekConfig.Model -Messages @((New-Message 'user' 'test'))
+        if (-not $deepseekPayload.Contains('provider') -or @($deepseekPayload.provider.order).Count -ne 1 -or $deepseekPayload.provider.order[0] -ne 'coreweave') {
+            [void]$failures.Add([PSCustomObject]@{ Command = 'DeepSeek OpenRouter routing payload'; Expected = 'provider.order = [coreweave]'; Actual = ($deepseekPayload | ConvertTo-Json -Depth 10 -Compress) })
+        }
+
+        $normalPayload = Build-OpenAICompatiblePayload -ModelConfig $openrouterConfig.Model -Messages @((New-Message 'user' 'test'))
+        if ($normalPayload.Contains('provider')) {
+            [void]$failures.Add([PSCustomObject]@{ Command = 'normal OpenAI-compatible payload'; Expected = 'no provider field'; Actual = ($normalPayload | ConvertTo-Json -Depth 10 -Compress) })
+        }
 
         $googleArgs = $baseArgs.PSObject.Copy()
         $googleArgs.model_profile = 'google-gemma-free'
         $googleConfig = Load-AgentConfig $googleArgs
         if ($googleConfig.Model.Provider -ne 'google-gemini' -or $googleConfig.Model.Model -ne 'models/gemma-4-26b-a4b-it') {
             [void]$failures.Add([PSCustomObject]@{ Command = 'google model profile'; Expected = 'google-gemini, models/gemma-4-26b-a4b-it'; Actual = "$($googleConfig.Model.Provider), $($googleConfig.Model.Model)" })
+        }
+        $googlePayload = Build-GooglePayload -ModelConfig $googleConfig.Model -Messages @((New-Message 'system' 'rules'), (New-Message 'user' 'test'))
+        if ($googlePayload.contents[0].role -ne 'user' -or $googlePayload.systemInstruction.parts[0].text -ne 'rules' -or $googlePayload.generationConfig.maxOutputTokens -ne 2048) {
+            [void]$failures.Add([PSCustomObject]@{ Command = 'Google Gemini payload'; Expected = 'unchanged Gemini roles, system instruction, and token setting'; Actual = ($googlePayload | ConvertTo-Json -Depth 10 -Compress) })
         }
 
         $overrideArgs = $openrouterArgs.PSObject.Copy()
