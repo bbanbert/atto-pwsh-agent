@@ -23,6 +23,21 @@ function atto-pwsh-agent {
     & 'C:\Users\j9100\tmp\agents\atto-pwsh-agent\agent-loop.ps1' @args
 }
 
+## Model providers and OpenRouter routing
+
+In a model profile, `provider = "openai-chat"` selects the OpenAI Chat Completions
+request dialect; it does not select an upstream OpenRouter inference provider.
+The separate `openrouter_provider_order` array is sent to OpenRouter as a provider
+preference. The default `openrouter-deepseek-flash-coreweave` profile tries
+CoreWeave first. If CoreWeave is unavailable, OpenRouter may use another compatible
+provider because fallback behavior is intentionally left enabled.
+
+Run the default profile with:
+
+```powershell
+.\agent-loop.ps1 "Describe your task"
+```
+
 
 ## manuell in Terminal
 ´´´ POWERSHELL
